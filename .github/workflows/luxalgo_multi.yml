@@ -1,0 +1,77 @@
+name: LuxAlgo Multi-TF Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'paper or live'
+        type: choice
+        options:
+          - paper
+          - live
+        required: true
+        default: paper
+      qty:
+        description: 'Quantity per timeframe'
+        type: string
+        required: true
+        default: '65'
+      intervals:
+        description: 'Comma-separated intervals (e.g. 3,5,15)'
+        type: string
+        required: true
+        default: '3,5,15'
+
+permissions:
+  contents: read
+
+jobs:
+  luxalgo-multi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          QTY: ${{ inputs.qty }}
+        run: |
+          case "$MODE" in
+            paper|live) ;;
+            *) echo "Invalid mode: $MODE" >&2; exit 1 ;;
+          esac
+          python -c 'import sys; n = int(sys.argv[1]); sys.exit(0 if 0 < n <= 100000 else 1)' "$QTY"
+
+      - name: Run multi-TF engine
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          TZ: Asia/Kolkata
+          MODE: ${{ inputs.mode }}
+          QTY: ${{ inputs.qty }}
+          INTERVALS: ${{ inputs.intervals }}
+        run: |
+          set -o pipefail
+          python -u luxalgo_upstox_multi_tf.py \
+            --mode "$MODE" \
+            --qty "$QTY" \
+            --intervals "$INTERVALS" \
+            2>&1 | tee luxalgo_console.log
+
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxalgo-multi-logs-${{ github.run_id }}
+          path: |
+            luxalgo_live_production_multi.log
+            luxalgo_console.log
+          if-no-files-found: ignore
+          retention-days: 3
