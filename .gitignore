@@ -1,0 +1,22 @@
+# Secrets
+.env
+*.token
+*token*
+
+# Runtime
+bot_state_multi.json
+*.log
+luxalgo_live_production_multi.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
