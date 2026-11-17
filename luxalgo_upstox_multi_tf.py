@@ -35,6 +35,7 @@ NIFTY_SPOT_KEY = "NSE_INDEX|Nifty 50"
 STATE_FILE = Path("bot_state_multi.json")
 
 STALE_GAP_SEC = 30  # a bar with a tick gap larger than this is considered unreliable
+STALE_SAME_PX = 15  # this many identical consecutive spot polls (~45 s) => frozen quote
 
 # Token resolution: UPSTOX_TOKEN (preferred) -> UPSTOX_ACCESS_TOKEN -> empty
 UPSTOX_ACCESS_TOKEN = (
@@ -94,10 +95,11 @@ def evaluate_trendlines(candles: list[dict], length: int = 14, mult: float = 1.0
     support_bounce = resistance_reject = False
     new_upper = new_lower = False
     upper_origin = lower_origin = None
+    upper_now = lower_now = None
 
     for i in range(n):
         p = i - length
-        # Pivot High
+        # Pivot High (Pine ta.pivothigh: left >=, right >)
         ph = candles[p]["high"] if (p >= length and
             all(candles[k]["high"] <= candles[p]["high"] for k in range(p - length, p)) and
             all(candles[k]["high"] < candles[p]["high"] for k in range(p + 1, p + length + 1))) else None
@@ -108,21 +110,21 @@ def evaluate_trendlines(candles: list[dict], length: int = 14, mult: float = 1.0
             all(candles[k]["low"] > candles[p]["low"] for k in range(p + 1, p + length + 1))) else None
 
         s = (atr[i] / length * mult) if atr[i] is not None else None
+        pivot_hi = ph is not None and s is not None
+        pivot_lo = pl is not None and s is not None
 
-        # Upper Trendline updates
-        if ph is not None and s is not None:
+        # Upper trendline: upper := ph ? ph : upper - slope_ph
+        if pivot_hi:
             slope_ph, upper = s, ph
-            upos = 0
             if i == n - 1:
                 new_upper = True
                 upper_origin = {"time": candles[p]["time"], "price": ph, "slope": slope_ph}
         elif upper is not None:
             upper -= slope_ph
 
-        # Lower Trendline updates
-        if pl is not None and s is not None:
+        # Lower trendline: lower := pl ? pl : lower + slope_pl
+        if pivot_lo:
             slope_pl, lower = s, pl
-            dnos = 0
             if i == n - 1:
                 new_lower = True
                 lower_origin = {"time": candles[p]["time"], "price": pl, "slope": slope_pl}
@@ -137,35 +139,40 @@ def evaluate_trendlines(candles: list[dict], length: int = 14, mult: float = 1.0
         c_low = candles[i]["low"]
         c_close = candles[i]["close"]
 
-        # Only evaluate signals on the latest closed candle
+        # LuxAlgo state machine (exact Pine semantics):
+        #   upos := ph ? 0 : close > line ? 1 : upos      'B' = upos rose 0 -> 1
+        # On the bar where a new pivot is confirmed the state is forced to 0, so a 'B'
+        # can never print on that bar (it can print on the next one).
+        up_prev, dn_prev = upos, dnos
+        if pivot_hi:
+            upos = 0
+        elif upper_now is not None and c_close > upper_now:
+            upos = 1
+        if pivot_lo:
+            dnos = 0
+        elif lower_now is not None and c_close < lower_now:
+            dnos = 1
+
+        # Only report signals for the latest closed candle
         if i == n - 1:
+            up_break = upos > up_prev
+            dn_break = dnos > dn_prev
             current_atr = atr[i] if atr[i] is not None else 15.0
             tol = max(4.0, current_atr * 0.20)  # Dynamic test tolerance
 
-            # A. Breakouts
-            if upper_now is not None and c_close > upper_now and upos == 0:
-                up_break = True
-            if lower_now is not None and c_close < lower_now and dnos == 0:
-                dn_break = True
-
-            # B. Support Bounce (CE Entry)
-            if lower_now is not None and not dn_break and dnos == 0:
+            # B. Support Bounce (CE Entry) - custom strategy, not a LuxAlgo label
+            if lower_now is not None and dnos == 0:
                 tested_support = c_low <= (lower_now + tol)
                 closed_green_above = (c_close > lower_now) and (c_close > c_open)
                 if tested_support and closed_green_above:
                     support_bounce = True
 
-            # C. Resistance Rejection (PE Entry)
-            if upper_now is not None and not up_break and upos == 0:
+            # C. Resistance Rejection (PE Entry) - custom strategy, not a LuxAlgo label
+            if upper_now is not None and upos == 0:
                 tested_resistance = c_high >= (upper_now - tol)
                 closed_red_below = (c_close < upper_now) and (c_close < c_open)
                 if tested_resistance and closed_red_below:
                     resistance_reject = True
-        else:
-            if upper_now is not None and c_close > upper_now:
-                upos = 1
-            if lower_now is not None and c_close < lower_now:
-                dnos = 1
 
     return {
         "upper": upper_now,
@@ -185,10 +192,11 @@ def evaluate_trendlines(candles: list[dict], length: int = 14, mult: float = 1.0
 # 2. UPSTOX API ADAPTER
 # ==========================================================================
 class UpstoxClient:
-    def __init__(self, token: str, mode: str = "paper", fill_timeout: int = 8):
+    def __init__(self, token: str, mode: str = "paper", fill_timeout: int = 8, paper_slippage: float = 1.0):
         self.token = token
         self.mode = mode
         self.fill_timeout = fill_timeout
+        self.paper_slippage = paper_slippage
         self.headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.token}",
@@ -214,6 +222,11 @@ class UpstoxClient:
         except Exception as e:
             logger.error(f"Warm-up fetch ({label}) failed: {e}")
         return out
+
+    def fetch_intraday_candles(self) -> dict:
+        """Official 1-minute candles for today (same data TradingView/NSE show)."""
+        key = quote(NIFTY_SPOT_KEY, safe="")
+        return self._fetch_candles(f"{BASE_URL}/historical-candle/intraday/{key}/1minute", "intraday-sync")
 
     def fetch_warmup_candles(self, days_back: int = 3) -> list[dict]:
         """Historical (previous days) + intraday (today) 1-minute candles, merged and sorted."""
@@ -375,9 +388,15 @@ class UpstoxClient:
 
     def place_order(self, instrument_key: str, side: str, qty: int, slippage_pct: float = 3.0, tag: str = "luxalgo") -> dict:
         if self.mode == "paper":
-            ltp = self.get_option_ltp(instrument_key) or 130.0
-            logger.info(f"[PAPER] {side} {qty} qty of {instrument_key} @ ~₹{ltp:.2f}")
-            return {"status": "SUCCESS", "fill_price": ltp, "filled_qty": qty, "order_id": "PAPER_ORDER"}
+            ltp = self.get_option_ltp(instrument_key)
+            if not ltp or ltp <= 0:
+                logger.error(f"[PAPER] Cannot fill {side}: no option LTP for {instrument_key}")
+                return {"status": "FAILED", "fill_price": 0.0, "filled_qty": 0, "order_id": None}
+            # Adverse paper slippage so paper P&L is not better than a real fill
+            adj = (1 + self.paper_slippage / 100.0) if side == "BUY" else (1 - self.paper_slippage / 100.0)
+            fill = max(0.05, round(round(ltp * adj / 0.05) * 0.05, 2))
+            logger.info(f"[PAPER] {side} {qty} qty of {instrument_key} @ ~₹{fill:.2f} (LTP {ltp:.2f})")
+            return {"status": "SUCCESS", "fill_price": fill, "filled_qty": qty, "order_id": "PAPER_ORDER"}
 
         ltp = self.get_option_ltp(instrument_key)
         if not ltp or ltp <= 0:
@@ -433,14 +452,16 @@ class UpstoxClient:
 # 3. CONTINUOUS RESAMPLER
 # ==========================================================================
 class Resampler:
+    """All bar times are tz-NAIVE IST wall-clock (same as the 1-minute warm-up data)."""
+
     def __init__(self, interval_sec: int, raw_candles: list[dict]):
         self.interval_sec = interval_sec
-        self.candles: list[dict] = []
         self.last_tick: datetime | None = None
         self.bar_max_gap = 0.0
-        self._seed(raw_candles)
+        self.bar_bad_feed = False
+        self.candles: list[dict] = self._group(raw_candles)
 
-    def _seed(self, raw: list[dict]):
+    def _group(self, raw: list[dict]) -> list[dict]:
         step = self.interval_sec
         grouped: dict = {}
         for c in raw:
@@ -451,44 +472,71 @@ class Resampler:
             slot = int((dt - anchor).total_seconds() // step)
             grouped.setdefault((dt.date(), slot), (anchor + timedelta(seconds=slot * step), []))[1].append(c)
 
+        out = []
         for _, (slot_start, grp) in sorted(grouped.items(), key=lambda x: x[0]):
-            self.candles.append({
+            grp.sort(key=lambda x: x["time"])
+            out.append({
                 "time": slot_start,
                 "open": grp[0]["open"],
                 "high": max(x["high"] for x in grp),
                 "low": min(x["low"] for x in grp),
                 "close": grp[-1]["close"],
             })
+        return out
 
     @staticmethod
     def _new_bar(slot_start: datetime, price: float) -> dict:
         return {"time": slot_start, "open": price, "high": price, "low": price, "close": price}
 
-    def on_tick(self, dt: datetime, price: float) -> dict | None:
+    def replace_closed(self, raw: list[dict], completed: dict, official_last: bool):
+        """Rebuild every CLOSED bar from official 1-minute candles; keep the forming bar.
+        If the official candle for the just-closed bar is not available yet, keep the polled one."""
+        if len(self.candles) < 2 and not self.candles:
+            return
+        forming = self.candles[-1]
+        closed = [b for b in self._group(raw) if b["time"] < forming["time"]]
+        if not official_last:
+            closed = [b for b in closed if b["time"] != completed["time"]]
+            closed.append(completed)
+            closed.sort(key=lambda b: b["time"])
+        self.candles = closed + [forming]
+
+    def on_tick(self, dt: datetime, price: float | None, feed_ok: bool = True) -> dict | None:
+        dt = dt.replace(tzinfo=None)  # FIX: warm-up bars are naive; aware != naive made every seeded bar look "closed"
         anchor = dt.replace(hour=9, minute=15, second=0, microsecond=0)
         slot = int((dt - anchor).total_seconds() // self.interval_sec)
         slot_start = anchor + timedelta(seconds=slot * self.interval_sec)
 
+        if price is None:  # frozen quote: only roll bars over, never invent a price move
+            if not self.candles:
+                return None
+            price = self.candles[-1]["close"]
+
         gap = (dt - self.last_tick).total_seconds() if self.last_tick else 0.0
         self.last_tick = dt
+        if not feed_ok:
+            self.bar_bad_feed = True
 
         if not self.candles:
             self.candles.append(self._new_bar(slot_start, price))
             self.bar_max_gap = 0.0
+            self.bar_bad_feed = not feed_ok
             return None
 
         last = self.candles[-1]
         if slot_start != last["time"]:
             completed = dict(last)
-            completed["stale"] = max(self.bar_max_gap, gap) > STALE_GAP_SEC
+            completed["stale"] = max(self.bar_max_gap, gap) > STALE_GAP_SEC or self.bar_bad_feed
             self.candles.append(self._new_bar(slot_start, price))
             self.bar_max_gap = 0.0
+            self.bar_bad_feed = not feed_ok
             return completed
 
         self.bar_max_gap = max(self.bar_max_gap, gap)
-        last["high"] = max(last["high"], price)
-        last["low"] = min(last["low"], price)
-        last["close"] = price
+        if feed_ok:
+            last["high"] = max(last["high"], price)
+            last["low"] = min(last["low"], price)
+            last["close"] = price
         return None
 
 
@@ -529,8 +577,13 @@ class MultiEngine:
                 if tf in self.cfg:
                     self.cfg[tf][key] = val
 
-        self.client = UpstoxClient(token=args.token, mode=args.mode, fill_timeout=args.fill_timeout)
+        self.client = UpstoxClient(token=args.token, mode=args.mode, fill_timeout=args.fill_timeout,
+                                   paper_slippage=args.paper_slippage)
         raw_warmup = self._load_warmup()
+        self.base_raw = {c["time"]: c for c in raw_warmup}
+        self._last_spot: float | None = None
+        self._same_px = 0
+        self.quote_stale = False
         self.resamplers = {tf: Resampler(tf * 60, raw_warmup) for tf in self.tfs}
         self.state = self._load_state()
         self.next_exit_try = {tf: 0.0 for tf in self.tfs}
@@ -639,28 +692,54 @@ class MultiEngine:
                     time.sleep(2)
                     continue
 
+                # Frozen-quote detection (the index LTP returned the same value for 13 minutes after 15:15)
+                if self._last_spot is not None and spot == self._last_spot:
+                    self._same_px += 1
+                else:
+                    self._same_px = 0
+                self._last_spot = spot
+                stale_now = self._same_px >= STALE_SAME_PX
+                if stale_now and not self.quote_stale:
+                    logger.warning(f"⚠️ Spot quote frozen at ₹{spot:.2f} for {self._same_px} polls: "
+                                   f"ignoring it for bar building and blocking new entries.")
+                elif self.quote_stale and not stale_now:
+                    logger.info("✅ Spot quote moving again.")
+                self.quote_stale = stale_now
+
                 if time.time() - last_heartbeat >= 30:
                     parts = []
                     for tf in self.tfs:
                         p = self._pos(tf)
                         parts.append(f"{tf}m: {p['symbol']} x{p['qty']} SL ₹{p['current_sl']:.2f}" if p
                                      else f"{tf}m: flat")
-                    logger.info(f"💓 [HEARTBEAT] Spot: ₹{spot:.2f} | {now.strftime('%H:%M:%S')} | "
-                                + " | ".join(parts))
+                    logger.info(f"💓 [HEARTBEAT] Spot: ₹{spot:.2f}{' (STALE)' if self.quote_stale else ''} | "
+                                f"{now.strftime('%H:%M:%S')} | " + " | ".join(parts))
                     last_heartbeat = time.time()
 
                 if self._open_tfs():
                     self.manage_positions()
 
+                completions: dict[int, dict] = {}
                 for tf in self.tfs:
-                    completed = self.resamplers[tf].on_tick(now, spot)
+                    completed = self.resamplers[tf].on_tick(
+                        now, None if self.quote_stale else spot, feed_ok=not self.quote_stale)
                     if completed and completed["time"].date() == now.date():
+                        completions[tf] = completed
+
+                if completions:
+                    self.sync_official(completions)
+                    for tf, polled in completions.items():
+                        rs = self.resamplers[tf]
+                        bar = rs.candles[-2] if len(rs.candles) >= 2 else polled
+                        if bar["time"] != polled["time"]:
+                            bar = polled
                         logger.info(
-                            f"[{tf}m] Closed bar [{completed['time'].strftime('%H:%M')}]: "
-                            f"O: {completed['open']:.2f} H: {completed['high']:.2f} "
-                            f"L: {completed['low']:.2f} C: {completed['close']:.2f}"
+                            f"[{tf}m] Closed bar [{bar['time'].strftime('%H:%M')}]: "
+                            f"O: {bar['open']:.2f} H: {bar['high']:.2f} "
+                            f"L: {bar['low']:.2f} C: {bar['close']:.2f}"
+                            f"{' (polled)' if bar is polled else ''}"
                         )
-                        self.process_signal(tf, completed, now)
+                        self.process_signal(tf, bar, now)
 
                 time.sleep(3.0)
 
@@ -672,6 +751,41 @@ class MultiEngine:
             except Exception as e:
                 logger.error(f"Runtime loop error: {e}")
                 time.sleep(2)
+
+    def sync_official(self, completions: dict[int, dict]):
+        """Replace polled bars with official 1-minute-derived bars (identical to TradingView).
+        Waits up to --sync-wait seconds for the last minute of the closed bar to be published;
+        if it is not, the polled version of that single bar is kept (and corrected next time)."""
+        needed = {
+            tf: c["time"] + timedelta(seconds=self.resamplers[tf].interval_sec) - timedelta(minutes=1)
+            for tf, c in completions.items()
+        }
+        deadline = time.time() + self.args.sync_wait
+        official: dict = {}
+        while True:
+            intra = self.client.fetch_intraday_candles()
+            if intra:
+                official = intra
+            if official and all(n in official for n in needed.values()):
+                break
+            if time.time() >= deadline:
+                break
+            if self._open_tfs():
+                self.manage_positions()
+            time.sleep(1.0)
+
+        if not official:
+            logger.warning("Official candle sync failed; using polled bars this round.")
+            return
+        merged = dict(self.base_raw)
+        merged.update(official)
+        raw = [merged[k] for k in sorted(merged)]
+        for tf, polled in completions.items():
+            ok = needed[tf] in official
+            if not ok:
+                logger.warning(f"[{tf}m] Official candle for [{polled['time'].strftime('%H:%M')}] not published yet; "
+                               f"using polled bar for it.")
+            self.resamplers[tf].replace_closed(raw, polled, official_last=ok)
 
     def manage_positions(self):
         ltp_cache: dict[str, float | None] = {}
@@ -723,11 +837,11 @@ class MultiEngine:
 
         if res["new_upper"]:
             orig = res["upper_origin"]
-            logger.info(f"🔴 [{tf}m] NEW RED RESISTANCE LINE from {orig['time'].strftime('%H:%M')} "
+            logger.info(f"🟦 [{tf}m] NEW UPPER (TEAL) RESISTANCE LINE from {orig['time'].strftime('%H:%M')} "
                         f"@ ₹{orig['price']:.2f} | Current Level: ₹{res['upper']:.2f}")
         if res["new_lower"]:
             orig = res["lower_origin"]
-            logger.info(f"🟢 [{tf}m] NEW GREEN SUPPORT LINE from {orig['time'].strftime('%H:%M')} "
+            logger.info(f"🟥 [{tf}m] NEW LOWER (RED) SUPPORT LINE from {orig['time'].strftime('%H:%M')} "
                         f"@ ₹{orig['price']:.2f} | Current Level: ₹{res['lower']:.2f}")
 
         if self._pos(tf) is not None:
@@ -745,6 +859,10 @@ class MultiEngine:
             side, trigger_type = "PE", "RESISTANCE REJECTION (RED LINE)"
 
         if not side:
+            return
+
+        if self.quote_stale:
+            logger.warning(f"[{tf}m] Signal {side} via {trigger_type} ignored: spot quote is frozen.")
             return
 
         if candle.get("stale"):
@@ -839,6 +957,10 @@ def main():
     parser.add_argument("--trail-at", dest="trail_at", default=None, help="Trail start %% per timeframe")
     parser.add_argument("--giveback", default=None, help="Trail giveback %% per timeframe")
     parser.add_argument("--fill-timeout", type=int, default=8, help="Seconds to wait for an order fill")
+    parser.add_argument("--sync-wait", dest="sync_wait", type=float, default=6.0,
+                        help="Max seconds to wait for the official 1-min candle after a bar closes")
+    parser.add_argument("--paper-slippage", dest="paper_slippage", type=float, default=1.0,
+                        help="Adverse slippage %% applied to paper fills")
     parser.add_argument("--token",
                         default=os.environ.get("UPSTOX_TOKEN") or os.environ.get("UPSTOX_ACCESS_TOKEN") or UPSTOX_ACCESS_TOKEN,
                         help="Upstox access token (env: UPSTOX_TOKEN preferred)")
