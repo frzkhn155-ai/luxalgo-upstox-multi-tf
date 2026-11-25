@@ -590,7 +590,7 @@ class MultiEngine:
 
     def _load_warmup(self) -> list[dict]:
         for attempt in range(1, 4):
-            raw = self.client.fetch_warmup_candles(days_back=4)
+            raw = self.client.fetch_warmup_candles(days_back=8)
             if raw:
                 return raw
             logger.warning(f"Warm-up attempt {attempt}/3 returned no data.")
@@ -957,7 +957,7 @@ def main():
     parser.add_argument("--trail-at", dest="trail_at", default=None, help="Trail start %% per timeframe")
     parser.add_argument("--giveback", default=None, help="Trail giveback %% per timeframe")
     parser.add_argument("--fill-timeout", type=int, default=8, help="Seconds to wait for an order fill")
-    parser.add_argument("--sync-wait", dest="sync_wait", type=float, default=6.0,
+    parser.add_argument("--sync-wait", dest="sync_wait", type=float, default=20.0,
                         help="Max seconds to wait for the official 1-min candle after a bar closes")
     parser.add_argument("--paper-slippage", dest="paper_slippage", type=float, default=1.0,
                         help="Adverse slippage %% applied to paper fills")
